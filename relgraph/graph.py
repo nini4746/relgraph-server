@@ -43,7 +43,7 @@ def _edge_key(a: str, b: str) -> tuple[str, str]:
 
 class RelGraph:
     def __init__(self, max_sessions: int = MAX_SESSIONS, session_idle_sec: float = SESSION_IDLE_SEC,
-                 max_items: int = MAX_ITEMS, max_edges: int = MAX_EDGES) -> None:
+                 max_items: int = MAX_ITEMS, max_edges: int = MAX_EDGES, wal=None) -> None:
         self._items: dict[str, Item] = {}
         self._edges: dict[tuple[str, str], float] = defaultdict(float)
         self._neighbors: dict[str, set[str]] = defaultdict(set)
@@ -57,6 +57,7 @@ class RelGraph:
         self._evicted_overflow = 0
         self._evicted_edges = 0
         self._rejected_items = 0
+        self._wal = wal  # optional WriteAheadLog instance
 
     def upsert_item(self, item: Item) -> None:
         with self._lock:
@@ -64,6 +65,9 @@ class RelGraph:
                 self._rejected_items += 1
                 raise ValueError(f"item cap reached ({self._max_items})")
             self._items[item.id] = item
+        if self._wal is not None:
+            self._wal.append("upsert_item",
+                             {"id": item.id, "name": item.name, "tags": list(item.tags)})
 
     def items(self) -> list[Item]:
         with self._lock:
@@ -99,7 +103,10 @@ class RelGraph:
                 self._neighbors[partner_id].add(item_id)
             session.events.append((item_id, ts))
             session.last_ts = ts
-            return len(partners)
+        if self._wal is not None:
+            self._wal.append("ingest",
+                             {"user_id": user_id, "item_id": item_id, "action": action, "ts": ts})
+        return len(partners)
 
     def edge_weight(self, a: str, b: str) -> float:
         with self._lock:
@@ -194,6 +201,31 @@ class RelGraph:
     def evict_idle_sessions(self, now: float) -> int:
         with self._lock:
             return self._evict_sessions_locked(now)
+
+    def replay_wal(self, wal) -> int:
+        """Replay a WAL into this graph. WAL writes are temporarily disabled to avoid
+        re-logging the replayed entries. Returns count of entries successfully applied."""
+        prior = self._wal
+        self._wal = None
+        applied = 0
+        try:
+            for entry in wal.replay():
+                op = entry.get("op")
+                if op == "upsert_item":
+                    self.upsert_item(Item(id=entry["id"], name=entry["name"],
+                                          tags=tuple(entry.get("tags", []))))
+                    applied += 1
+                elif op == "ingest":
+                    try:
+                        self.ingest(user_id=entry["user_id"], item_id=entry["item_id"],
+                                    action=entry["action"], ts=float(entry["ts"]))
+                        applied += 1
+                    except (KeyError, ValueError):
+                        # item missing or unknown action — skip, advance log
+                        continue
+        finally:
+            self._wal = prior
+        return applied
 
     def _evict_weakest_edge_locked(self) -> None:
         # find the lowest-weight edge and remove it; also update neighbor sets.

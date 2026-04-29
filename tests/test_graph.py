@@ -194,6 +194,46 @@ def test_edge_cap_evicts_weakest_edge_under_pressure() -> None:
     assert s["evicted_edges"] >= 1
 
 
+def test_wal_round_trip_recovers_items_and_events(tmp_path) -> None:
+    from relgraph.wal import WriteAheadLog
+    wal_path = str(tmp_path / "wal.jsonl")
+    wal = WriteAheadLog(wal_path)
+    g = RelGraph(wal=wal)
+    g.upsert_item(Item(id="a", name="A"))
+    g.upsert_item(Item(id="b", name="B", tags=("x",)))
+    g.ingest("u1", "a", "view", ts=1.0)
+    g.ingest("u1", "b", "purchase", ts=2.0)
+    weight_before = g.edge_weight("a", "b")
+    wal.close()
+
+    wal2 = WriteAheadLog(wal_path)
+    g2 = RelGraph()
+    applied = g2.replay_wal(wal2)
+    assert applied == 4
+    assert {it.id for it in g2.items()} == {"a", "b"}
+    assert g2.edge_weight("a", "b") == weight_before
+    wal2.close()
+
+
+def test_wal_torn_write_is_skipped(tmp_path) -> None:
+    from relgraph.wal import WriteAheadLog
+    wal_path = str(tmp_path / "wal_torn.jsonl")
+    wal = WriteAheadLog(wal_path)
+    g = RelGraph(wal=wal)
+    g.upsert_item(Item(id="a", name="A"))
+    wal.close()
+
+    with open(wal_path, "ab") as f:
+        f.write(b'{"op":"upsert_item","id":"b"')
+
+    wal2 = WriteAheadLog(wal_path)
+    g2 = RelGraph()
+    applied = g2.replay_wal(wal2)
+    assert applied == 1
+    assert {it.id for it in g2.items()} == {"a"}
+    wal2.close()
+
+
 def test_stats_exposes_eviction_config() -> None:
     g = RelGraph(max_sessions=42, session_idle_sec=99.0)
     s = g.stats()
