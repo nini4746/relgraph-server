@@ -96,3 +96,41 @@ def test_search_ranks_by_centrality() -> None:
     out = g.search("thing")
     assert out[0]["item_id"] in {"b", "c"}
     assert out[-1]["item_id"] == "d"
+
+
+def test_idle_sessions_are_evicted_and_counted() -> None:
+    g = RelGraph(max_sessions=100, session_idle_sec=10.0)
+    g.upsert_item(Item(id="x", name="X"))
+    g.ingest("alice", "x", "view", ts=0.0)
+    g.ingest("bob", "x", "view", ts=5.0)
+
+    # 50s elapsed → both alice and bob exceed idle TTL=10s
+    removed = g.evict_idle_sessions(now=50.0)
+    assert removed == 2
+    s = g.stats()
+    assert s["users"] == 0
+    assert s["evicted_idle"] == 2
+    assert s["evicted_overflow"] == 0
+
+
+def test_overflow_eviction_drops_oldest_session() -> None:
+    g = RelGraph(max_sessions=2, session_idle_sec=1_000_000.0)
+    g.upsert_item(Item(id="x", name="X"))
+    g.ingest("u1", "x", "view", ts=10.0)
+    g.ingest("u2", "x", "view", ts=20.0)
+    # third user pushes past max_sessions=2; oldest (u1) gets dropped
+    g.ingest("u3", "x", "view", ts=30.0)
+
+    s = g.stats()
+    assert s["users"] == 2
+    assert s["evicted_overflow"] >= 1
+    assert s["evicted_idle"] == 0
+
+
+def test_stats_exposes_eviction_config() -> None:
+    g = RelGraph(max_sessions=42, session_idle_sec=99.0)
+    s = g.stats()
+    assert s["max_sessions"] == 42
+    assert s["session_idle_sec"] == 99.0
+    assert s["evicted_idle"] == 0
+    assert s["evicted_overflow"] == 0

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import os
+from contextlib import asynccontextmanager
 from time import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from .graph import Item, RelGraph
+from .graph import MAX_SESSIONS, SESSION_IDLE_SEC, Item, RelGraph
 
 
 class ItemIn(BaseModel):
@@ -26,9 +29,52 @@ class RecommendIn(BaseModel):
     k: int = 10
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def create_app(graph: RelGraph | None = None) -> FastAPI:
-    g = graph or RelGraph()
-    app = FastAPI(title="relgraph-server")
+    if graph is None:
+        max_sessions = _env_int("RELGRAPH_MAX_SESSIONS", MAX_SESSIONS)
+        idle_sec = _env_float("RELGRAPH_SESSION_IDLE_SEC", float(SESSION_IDLE_SEC))
+        g = RelGraph(max_sessions=max_sessions, session_idle_sec=idle_sec)
+    else:
+        g = graph
+
+    sweep_interval = _env_float("RELGRAPH_SWEEP_INTERVAL_SEC", 0.0)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        task = None
+        if sweep_interval > 0:
+            async def sweeper():
+                while True:
+                    await asyncio.sleep(sweep_interval)
+                    g.evict_idle_sessions(time())
+            task = asyncio.create_task(sweeper())
+        try:
+            yield
+        finally:
+            if task is not None:
+                task.cancel()
+
+    app = FastAPI(title="relgraph-server", lifespan=lifespan)
 
     @app.get("/health")
     def health() -> dict:
