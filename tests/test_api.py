@@ -56,3 +56,22 @@ def test_event_unknown_action_returns_400() -> None:
     c.post("/items", json={"id": "x", "name": "X"})
     r = c.post("/events", json={"user_id": "u", "item_id": "x", "action": "stare", "ts": 0})
     assert r.status_code == 400
+
+
+def test_metrics_endpoint_exposes_counters() -> None:
+    c = _client()
+    c.post("/items", json={"id": "m1", "name": "M1"})
+    c.post("/items", json={"id": "m2", "name": "M2"})
+    c.post("/events", json={"user_id": "u", "item_id": "m1", "action": "view", "ts": 0})
+    c.post("/events", json={"user_id": "u", "item_id": "m2", "action": "purchase", "ts": 1})
+    c.post("/recommend", json={"item_id": "m1", "k": 5})
+    c.get("/search", params={"q": "M"})
+
+    r = c.get("/metrics")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    body = r.text
+    assert "relgraph_events_total" in body
+    assert "relgraph_recommends_total" in body
+    assert "relgraph_searches_total" in body
+    assert "relgraph_items" in body

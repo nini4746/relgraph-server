@@ -5,10 +5,11 @@ import os
 from contextlib import asynccontextmanager
 from time import time
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from .graph import MAX_SESSIONS, SESSION_IDLE_SEC, Item, RelGraph
+from .metrics import GraphMetrics
 
 
 class ItemIn(BaseModel):
@@ -58,6 +59,22 @@ def create_app(graph: RelGraph | None = None) -> FastAPI:
         g = graph
 
     sweep_interval = _env_float("RELGRAPH_SWEEP_INTERVAL_SEC", 0.0)
+    metrics = GraphMetrics()
+    last_evicted = {"idle": 0, "overflow": 0}
+
+    def refresh_metrics() -> None:
+        s = g.stats()
+        metrics.items_gauge.set(s["items"])
+        metrics.edges_gauge.set(s["edges"])
+        metrics.users_gauge.set(s["users"])
+        idle_delta = s["evicted_idle"] - last_evicted["idle"]
+        overflow_delta = s["evicted_overflow"] - last_evicted["overflow"]
+        if idle_delta > 0:
+            metrics.session_evictions.labels(kind="idle").inc(idle_delta)
+            last_evicted["idle"] = s["evicted_idle"]
+        if overflow_delta > 0:
+            metrics.session_evictions.labels(kind="overflow").inc(overflow_delta)
+            last_evicted["overflow"] = s["evicted_overflow"]
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -103,18 +120,30 @@ def create_app(graph: RelGraph | None = None) -> FastAPI:
             raise HTTPException(404, f"unknown item: {e.args[0]}")
         except ValueError as e:
             raise HTTPException(400, str(e))
+        metrics.events.labels(action=payload.action).inc()
         return {"linked": partners}
 
     @app.post("/recommend")
     def recommend(payload: RecommendIn) -> dict:
         try:
-            return {"item_id": payload.item_id, "results": g.recommend(payload.item_id, payload.k)}
+            with metrics.recommend_latency.time():
+                results = g.recommend(payload.item_id, payload.k)
         except KeyError:
             raise HTTPException(404, f"unknown item: {payload.item_id}")
+        metrics.recommends.inc()
+        return {"item_id": payload.item_id, "results": results}
 
     @app.get("/search")
     def search(q: str, k: int = 10) -> dict:
-        return {"q": q, "results": g.search(q, k)}
+        results = g.search(q, k)
+        metrics.searches.inc()
+        return {"q": q, "results": results}
+
+    @app.get("/metrics")
+    def metrics_endpoint() -> Response:
+        refresh_metrics()
+        body, content_type = metrics.render()
+        return Response(content=body, media_type=content_type)
 
     return app
 
