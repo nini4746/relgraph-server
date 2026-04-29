@@ -127,6 +127,40 @@ def test_overflow_eviction_drops_oldest_session() -> None:
     assert s["evicted_idle"] == 0
 
 
+def test_snapshot_round_trip_preserves_items_and_edges(tmp_path) -> None:
+    g = RelGraph()
+    g.upsert_item(Item(id="a", name="A", tags=("x",)))
+    g.upsert_item(Item(id="b", name="B"))
+    g.ingest("u1", "a", "view", ts=10.0)
+    g.ingest("u1", "b", "purchase", ts=11.0)
+    weight_before = g.edge_weight("a", "b")
+
+    snap_path = str(tmp_path / "snap.json")
+    stats = g.snapshot_to_file(snap_path)
+    assert stats["items"] == 2
+    assert stats["edges"] == 1
+
+    restored = RelGraph()
+    restored.load_from_file(snap_path)
+    assert {it.id for it in restored.items()} == {"a", "b"}
+    assert restored.edge_weight("a", "b") == weight_before
+    rec = restored.recommend("a")
+    assert rec[0]["item_id"] == "b"
+
+
+def test_snapshot_atomic_replace(tmp_path) -> None:
+    g = RelGraph()
+    g.upsert_item(Item(id="x", name="X"))
+    snap_path = str(tmp_path / "snap.json")
+    g.snapshot_to_file(snap_path)
+    # second snapshot must replace the first cleanly
+    g.upsert_item(Item(id="y", name="Y"))
+    g.snapshot_to_file(snap_path)
+    restored = RelGraph()
+    restored.load_from_file(snap_path)
+    assert {it.id for it in restored.items()} == {"x", "y"}
+
+
 def test_stats_exposes_eviction_config() -> None:
     g = RelGraph(max_sessions=42, session_idle_sec=99.0)
     s = g.stats()

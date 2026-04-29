@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from threading import Lock
@@ -175,3 +178,50 @@ class RelGraph:
     def evict_idle_sessions(self, now: float) -> int:
         with self._lock:
             return self._evict_sessions_locked(now)
+
+    def snapshot_to_file(self, path: str) -> dict:
+        """Atomically write items + edges + neighbors to a JSON file. Returns counts."""
+        with self._lock:
+            payload = {
+                "version": 1,
+                "items": [{"id": it.id, "name": it.name, "tags": list(it.tags)}
+                          for it in self._items.values()],
+                "edges": [{"a": k[0], "b": k[1], "w": w} for k, w in self._edges.items()],
+                "neighbors": {k: sorted(v) for k, v in self._neighbors.items()},
+                "stats": {
+                    "items": len(self._items),
+                    "edges": len(self._edges),
+                    "evicted_idle": self._evicted_idle,
+                    "evicted_overflow": self._evicted_overflow,
+                },
+            }
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".relgraph-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        return payload["stats"]
+
+    def load_from_file(self, path: str) -> dict:
+        """Restore items/edges/neighbors from a snapshot. Sessions are NOT restored (ephemeral)."""
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("version") != 1:
+            raise ValueError(f"unsupported snapshot version: {payload.get('version')!r}")
+        with self._lock:
+            self._items = {it["id"]: Item(id=it["id"], name=it["name"], tags=tuple(it["tags"]))
+                           for it in payload["items"]}
+            self._edges = defaultdict(float)
+            for e in payload["edges"]:
+                self._edges[_edge_key(e["a"], e["b"])] = float(e["w"])
+            self._neighbors = defaultdict(set)
+            for k, v in payload["neighbors"].items():
+                self._neighbors[k] = set(v)
+        return payload["stats"]
