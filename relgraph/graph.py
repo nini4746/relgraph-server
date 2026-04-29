@@ -20,6 +20,8 @@ SESSION_WINDOW = 5
 SESSION_GAP_SEC = 30 * 60
 MAX_SESSIONS = 100_000
 SESSION_IDLE_SEC = 24 * 60 * 60
+MAX_ITEMS = 1_000_000
+MAX_EDGES = 5_000_000
 
 
 @dataclass
@@ -40,7 +42,8 @@ def _edge_key(a: str, b: str) -> tuple[str, str]:
 
 
 class RelGraph:
-    def __init__(self, max_sessions: int = MAX_SESSIONS, session_idle_sec: float = SESSION_IDLE_SEC) -> None:
+    def __init__(self, max_sessions: int = MAX_SESSIONS, session_idle_sec: float = SESSION_IDLE_SEC,
+                 max_items: int = MAX_ITEMS, max_edges: int = MAX_EDGES) -> None:
         self._items: dict[str, Item] = {}
         self._edges: dict[tuple[str, str], float] = defaultdict(float)
         self._neighbors: dict[str, set[str]] = defaultdict(set)
@@ -48,11 +51,18 @@ class RelGraph:
         self._lock = Lock()
         self._max_sessions = max_sessions
         self._session_idle_sec = session_idle_sec
+        self._max_items = max_items
+        self._max_edges = max_edges
         self._evicted_idle = 0
         self._evicted_overflow = 0
+        self._evicted_edges = 0
+        self._rejected_items = 0
 
     def upsert_item(self, item: Item) -> None:
         with self._lock:
+            if item.id not in self._items and len(self._items) >= self._max_items:
+                self._rejected_items += 1
+                raise ValueError(f"item cap reached ({self._max_items})")
             self._items[item.id] = item
 
     def items(self) -> list[Item]:
@@ -82,6 +92,8 @@ class RelGraph:
             for partner_id, partner_ts in partners:
                 gap_decay = max(0.1, 1.0 - (ts - partner_ts) / SESSION_GAP_SEC)
                 key = _edge_key(item_id, partner_id)
+                if key not in self._edges and len(self._edges) >= self._max_edges:
+                    self._evict_weakest_edge_locked()
                 self._edges[key] += weight * gap_decay
                 self._neighbors[item_id].add(partner_id)
                 self._neighbors[partner_id].add(item_id)
@@ -150,8 +162,12 @@ class RelGraph:
                 "users": len(self._sessions),
                 "max_sessions": self._max_sessions,
                 "session_idle_sec": self._session_idle_sec,
+                "max_items": self._max_items,
+                "max_edges": self._max_edges,
                 "evicted_idle": self._evicted_idle,
                 "evicted_overflow": self._evicted_overflow,
+                "evicted_edges": self._evicted_edges,
+                "rejected_items": self._rejected_items,
             }
 
     def bulk_upsert(self, items: Iterable[Item]) -> None:
@@ -178,6 +194,20 @@ class RelGraph:
     def evict_idle_sessions(self, now: float) -> int:
         with self._lock:
             return self._evict_sessions_locked(now)
+
+    def _evict_weakest_edge_locked(self) -> None:
+        # find the lowest-weight edge and remove it; also update neighbor sets.
+        weakest_key, _ = min(self._edges.items(), key=lambda kv: kv[1])
+        a, b = weakest_key
+        del self._edges[weakest_key]
+        # only remove neighbor link if no other edge connects them (always true since each pair has 1 edge)
+        self._neighbors[a].discard(b)
+        self._neighbors[b].discard(a)
+        if not self._neighbors[a]:
+            del self._neighbors[a]
+        if not self._neighbors[b]:
+            del self._neighbors[b]
+        self._evicted_edges += 1
 
     def snapshot_to_file(self, path: str) -> dict:
         """Atomically write items + edges + neighbors to a JSON file. Returns counts."""

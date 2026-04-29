@@ -161,6 +161,39 @@ def test_snapshot_atomic_replace(tmp_path) -> None:
     assert {it.id for it in restored.items()} == {"x", "y"}
 
 
+def test_item_cap_rejects_new_items_above_limit() -> None:
+    g = RelGraph(max_items=2)
+    g.upsert_item(Item(id="a", name="A"))
+    g.upsert_item(Item(id="b", name="B"))
+    # update existing item is fine
+    g.upsert_item(Item(id="a", name="A2"))
+    try:
+        g.upsert_item(Item(id="c", name="C"))
+        raise AssertionError("expected ValueError on item cap")
+    except ValueError:
+        pass
+    s = g.stats()
+    assert s["rejected_items"] == 1
+
+
+def test_edge_cap_evicts_weakest_edge_under_pressure() -> None:
+    g = RelGraph(max_edges=2)
+    for x in ("a", "b", "c", "d"):
+        g.upsert_item(Item(id=x, name=x.upper()))
+    # build edges a-b (purchase, weight ~8) and a-c (view, weight ~1) and b-c (purchase)
+    g.ingest("u1", "a", "purchase", ts=0)
+    g.ingest("u1", "b", "purchase", ts=1)
+    g.ingest("u2", "a", "view", ts=10)
+    g.ingest("u2", "c", "view", ts=11)
+    # at this point: edges a-b (strong), a-c (weak), edge count = 2 (cap)
+    # adding b-c (purchase) should evict weakest (a-c)
+    g.ingest("u3", "b", "purchase", ts=20)
+    g.ingest("u3", "c", "purchase", ts=21)
+    s = g.stats()
+    assert s["edges"] <= 2
+    assert s["evicted_edges"] >= 1
+
+
 def test_stats_exposes_eviction_config() -> None:
     g = RelGraph(max_sessions=42, session_idle_sec=99.0)
     s = g.stats()
