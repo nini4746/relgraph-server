@@ -11,6 +11,8 @@
 - **추천**: 아이템 인접 노드를 엣지 가중치 내림차순
 - **검색**: 이름 부분일치 + 태그 일치, 노드 중심성(인접 가중치 합)으로 랭킹
 - ML/외부 그래프 DB 사용하지 않음. 표준 라이브러리 + FastAPI만 사용.
+- **영속화**: WAL (`relgraph/wal.py`) + 스냅샷 — 부팅 시 재생, 운영 시 append-only.
+- **관측**: Prometheus exposition (`GET /metrics`) — 이벤트/추천 카운터, 추천 P50/P95 히스토그램.
 
 ## 실행
 
@@ -43,7 +45,7 @@ curl 'localhost:8000/search?q=fruit'
 .venv/bin/pytest -v
 ```
 
-11개 테스트 통과 (그래프 7건, API 4건).
+21개 테스트 통과 (graph + api + wal/metrics).
 
 ## 성능 (참고치, 단일 프로세스)
 
@@ -58,6 +60,13 @@ curl 'localhost:8000/search?q=fruit'
 
 ## 한계
 
-- 영속화 없음(메모리만). 재시작 시 그래프 손실.
+- 단일 프로세스 인메모리. 수평 확장은 sharding 필요.
 - 아이템/엣지 무한 누적, 실제 운영에는 LRU/감쇠 일괄 작업 필요.
 - 검색은 부분일치만 지원. n-gram/형태소 분석 미적용.
+
+## 추가 도구
+
+```bash
+.venv/bin/python scripts/seed.py    # 10k items / 500k events 벤치
+curl localhost:8000/metrics         # Prometheus exposition
+```
