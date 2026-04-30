@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import tempfile
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -134,6 +135,178 @@ class RelGraph:
                     }
                 )
             return out
+
+    def recommend_random_walk(self, item_id: str, k: int = 10, *,
+                              walks: int = 200, depth: int = 3,
+                              restart: float = 0.15, seed: int | None = None) -> list[dict]:
+        """Personalized PageRank-ish via short random walks with restart.
+        Edges sampled proportionally to weight; visit counts (excluding seed) scored.
+        """
+        if item_id not in self._items:
+            raise KeyError(item_id)
+        rng = random.Random(seed)
+        with self._lock:
+            visits: dict[str, int] = defaultdict(int)
+            for _ in range(walks):
+                node = item_id
+                for _ in range(depth):
+                    if rng.random() < restart:
+                        node = item_id
+                        continue
+                    nbs = list(self._neighbors.get(node, ()))
+                    if not nbs:
+                        break
+                    weights = [self._edges[_edge_key(node, nb)] for nb in nbs]
+                    total = sum(weights)
+                    if total <= 0:
+                        break
+                    r = rng.random() * total
+                    acc = 0.0
+                    pick = nbs[-1]
+                    for nb, w in zip(nbs, weights):
+                        acc += w
+                        if r <= acc:
+                            pick = nb
+                            break
+                    node = pick
+                    if node != item_id:
+                        visits[node] += 1
+            scored = sorted(visits.items(), key=lambda x: (-x[1], x[0]))
+            out = []
+            for nb_id, count in scored[:k]:
+                if nb_id not in self._items:
+                    continue
+                nb = self._items[nb_id]
+                edge_w = self._edges.get(_edge_key(item_id, nb_id), 0.0)
+                hops = "direct" if edge_w > 0 else "multi-hop"
+                out.append({
+                    "item_id": nb_id,
+                    "name": nb.name,
+                    "score": count,
+                    "why": f"random-walk visits={count} from {item_id} ({hops})",
+                })
+            return out
+
+    def recommend_for_user(self, user_id: str, k: int = 10) -> list[dict]:
+        """Aggregate recommendations from items in user's recent session window.
+        Excludes items the user already touched. Scores summed across seeds.
+        """
+        with self._lock:
+            session = self._sessions.get(user_id)
+            if session is None or not session.events:
+                return []
+            seen = {ev[0] for ev in session.events}
+            agg: dict[str, float] = defaultdict(float)
+            seeds: dict[str, list[str]] = defaultdict(list)
+            for seed_id, _ in session.events:
+                for nb in self._neighbors.get(seed_id, ()):
+                    if nb in seen:
+                        continue
+                    w = self._edges[_edge_key(seed_id, nb)]
+                    agg[nb] += w
+                    seeds[nb].append(seed_id)
+            scored = sorted(agg.items(), key=lambda x: (-x[1], x[0]))
+            out = []
+            for nb_id, score in scored[:k]:
+                if nb_id not in self._items:
+                    continue
+                nb = self._items[nb_id]
+                contrib = ",".join(seeds[nb_id][:3])
+                out.append({
+                    "item_id": nb_id,
+                    "name": nb.name,
+                    "score": round(score, 4),
+                    "why": f"co-occurred with session [{contrib}] (sum_w={round(score, 2)})",
+                })
+            return out
+
+    def subgraph(self, item_id: str, depth: int = 1, max_nodes: int = 64) -> dict:
+        """Return BFS subgraph (nodes + edges) up to `depth` hops."""
+        if item_id not in self._items:
+            raise KeyError(item_id)
+        with self._lock:
+            visited = {item_id}
+            frontier = {item_id}
+            for _ in range(max(0, depth)):
+                nxt = set()
+                for n in frontier:
+                    for nb in self._neighbors.get(n, ()):
+                        if nb in visited:
+                            continue
+                        if len(visited) >= max_nodes:
+                            break
+                        visited.add(nb)
+                        nxt.add(nb)
+                    if len(visited) >= max_nodes:
+                        break
+                frontier = nxt
+            nodes = []
+            for nid in visited:
+                it = self._items.get(nid)
+                if it is None:
+                    continue
+                nodes.append({"item_id": nid, "name": it.name, "tags": list(it.tags)})
+            edges = []
+            seen_edge: set[tuple[str, str]] = set()
+            for n in visited:
+                for nb in self._neighbors.get(n, ()):
+                    if nb not in visited:
+                        continue
+                    key = _edge_key(n, nb)
+                    if key in seen_edge:
+                        continue
+                    seen_edge.add(key)
+                    edges.append({"a": key[0], "b": key[1], "w": round(self._edges[key], 4)})
+            return {"root": item_id, "depth": depth, "nodes": nodes, "edges": edges}
+
+    def remove_item(self, item_id: str) -> int:
+        """Delete an item and all its edges. Returns edges removed."""
+        with self._lock:
+            if item_id not in self._items:
+                raise KeyError(item_id)
+            nbs = list(self._neighbors.get(item_id, ()))
+            removed = 0
+            for nb in nbs:
+                key = _edge_key(item_id, nb)
+                if self._edges.pop(key, None) is not None:
+                    removed += 1
+                self._neighbors[nb].discard(item_id)
+                if not self._neighbors[nb]:
+                    del self._neighbors[nb]
+            self._neighbors.pop(item_id, None)
+            del self._items[item_id]
+            return removed
+
+    def decay_edges(self, factor: float, prune_below: float = 0.0) -> int:
+        """Multiply all edge weights by `factor` (0<f<=1). Edges <= prune_below removed.
+        Returns count of edges pruned."""
+        if not (0.0 < factor <= 1.0):
+            raise ValueError("factor must be in (0,1]")
+        with self._lock:
+            pruned = 0
+            for key in list(self._edges.keys()):
+                self._edges[key] *= factor
+                if self._edges[key] <= prune_below:
+                    a, b = key
+                    del self._edges[key]
+                    self._neighbors[a].discard(b)
+                    self._neighbors[b].discard(a)
+                    if not self._neighbors[a]:
+                        self._neighbors.pop(a, None)
+                    if not self._neighbors[b]:
+                        self._neighbors.pop(b, None)
+                    pruned += 1
+            return pruned
+
+    def compact_wal(self, snapshot_path: str) -> dict:
+        """Snapshot current state then rotate the WAL. Net effect: WAL shrinks to empty.
+        Returns dict with snapshot stats and archived wal path (or None)."""
+        if self._wal is None:
+            raise RuntimeError("no WAL configured")
+        stats = self.snapshot_to_file(snapshot_path)
+        suffix = f"compacted-{int(__import__('time').time()*1000)}"
+        archived = self._wal.rotate(suffix)
+        return {"snapshot": stats, "archived_wal": archived}
 
     def _centrality(self, item_id: str) -> float:
         return sum(self._edges[_edge_key(item_id, nb)] for nb in self._neighbors.get(item_id, ()))

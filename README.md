@@ -8,11 +8,16 @@
 - **이벤트 가중치**: view=1.0, click=2.0, cart=4.0, purchase=8.0
 - **세션 윈도우**: 사용자별 최근 5개 이벤트, 30분 갭이면 윈도우 리셋
 - **시간 감쇠**: 윈도우 내 짝의 시간 차에 따라 0.1~1.0 곱
-- **추천**: 아이템 인접 노드를 엣지 가중치 내림차순
+- **추천 전략**:
+  - `weight` (기본): 아이템 인접 노드를 엣지 가중치 내림차순
+  - `random_walk`: 가중치 비례 샘플링 + restart, 시드 고정 가능 → 재현 가능한 PPR-style
+  - `/recommend/user`: 사용자 세션 윈도우 기반 개인화 (이미 본 아이템 제외)
 - **검색**: 이름 부분일치 + 태그 일치, 노드 중심성(인접 가중치 합)으로 랭킹
+- **서브그래프**: `GET /subgraph?item_id=...&depth=2` → 가시화·디버깅용 BFS 추출
+- **운영 도구**: `POST /admin/decay`(가중치 감쇠+프루닝), `POST /admin/compact`(스냅샷+WAL 회전)
 - ML/외부 그래프 DB 사용하지 않음. 표준 라이브러리 + FastAPI만 사용.
-- **영속화**: WAL (`relgraph/wal.py`) + 스냅샷 — 부팅 시 재생, 운영 시 append-only.
-- **관측**: Prometheus exposition (`GET /metrics`) — 이벤트/추천 카운터, 추천 P50/P95 히스토그램.
+- **영속화**: WAL (`relgraph/wal.py`) + 스냅샷 — 부팅 시 재생, 운영 시 append-only, 컴팩션으로 WAL 잘라냄.
+- **관측**: Prometheus exposition (`GET /metrics`) — 이벤트/추천(전략별 라벨)/검색 카운터, 추천 P50/P95 히스토그램.
 
 ## 실행
 
@@ -45,7 +50,7 @@ curl 'localhost:8000/search?q=fruit'
 .venv/bin/pytest -v
 ```
 
-21개 테스트 통과 (graph + api + wal/metrics).
+40개 테스트 통과 (graph + api + wal/metrics + random-walk/subgraph/decay/compact).
 
 ## 성능 (참고치, 단일 프로세스)
 

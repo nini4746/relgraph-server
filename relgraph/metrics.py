@@ -22,6 +22,7 @@ class GraphMetrics:
         self.recommends = Counter(
             "relgraph_recommends_total",
             "Total recommend calls",
+            ["strategy"],
             registry=self.registry,
         )
         self.recommend_latency = Histogram(

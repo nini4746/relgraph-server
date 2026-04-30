@@ -28,6 +28,25 @@ class EventIn(BaseModel):
 class RecommendIn(BaseModel):
     item_id: str
     k: int = 10
+    strategy: str = "weight"  # "weight" | "random_walk"
+    walks: int = 200
+    depth: int = 3
+    restart: float = 0.15
+    seed: int | None = None
+
+
+class RecommendUserIn(BaseModel):
+    user_id: str
+    k: int = 10
+
+
+class CompactIn(BaseModel):
+    snapshot_path: str
+
+
+class DecayIn(BaseModel):
+    factor: float
+    prune_below: float = 0.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -127,11 +146,57 @@ def create_app(graph: RelGraph | None = None) -> FastAPI:
     def recommend(payload: RecommendIn) -> dict:
         try:
             with metrics.recommend_latency.time():
-                results = g.recommend(payload.item_id, payload.k)
+                if payload.strategy == "random_walk":
+                    results = g.recommend_random_walk(
+                        payload.item_id, payload.k,
+                        walks=payload.walks, depth=payload.depth,
+                        restart=payload.restart, seed=payload.seed,
+                    )
+                elif payload.strategy == "weight":
+                    results = g.recommend(payload.item_id, payload.k)
+                else:
+                    raise HTTPException(400, f"unknown strategy: {payload.strategy}")
         except KeyError:
             raise HTTPException(404, f"unknown item: {payload.item_id}")
-        metrics.recommends.inc()
-        return {"item_id": payload.item_id, "results": results}
+        metrics.recommends.labels(strategy=payload.strategy).inc()
+        return {"item_id": payload.item_id, "strategy": payload.strategy, "results": results}
+
+    @app.post("/recommend/user")
+    def recommend_user(payload: RecommendUserIn) -> dict:
+        with metrics.recommend_latency.time():
+            results = g.recommend_for_user(payload.user_id, payload.k)
+        metrics.recommends.labels(strategy="user").inc()
+        return {"user_id": payload.user_id, "results": results}
+
+    @app.get("/subgraph")
+    def subgraph(item_id: str, depth: int = 1, max_nodes: int = 64) -> dict:
+        try:
+            return g.subgraph(item_id, depth=depth, max_nodes=max_nodes)
+        except KeyError:
+            raise HTTPException(404, f"unknown item: {item_id}")
+
+    @app.delete("/items/{item_id}")
+    def delete_item(item_id: str) -> dict:
+        try:
+            removed = g.remove_item(item_id)
+        except KeyError:
+            raise HTTPException(404, f"unknown item: {item_id}")
+        return {"item_id": item_id, "edges_removed": removed}
+
+    @app.post("/admin/decay")
+    def admin_decay(payload: DecayIn) -> dict:
+        try:
+            pruned = g.decay_edges(payload.factor, prune_below=payload.prune_below)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"pruned": pruned}
+
+    @app.post("/admin/compact")
+    def admin_compact(payload: CompactIn) -> dict:
+        try:
+            return g.compact_wal(payload.snapshot_path)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
 
     @app.get("/search")
     def search(q: str, k: int = 10) -> dict:
