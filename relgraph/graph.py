@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
@@ -23,6 +24,30 @@ MAX_SESSIONS = 100_000
 SESSION_IDLE_SEC = 24 * 60 * 60
 MAX_ITEMS = 1_000_000
 MAX_EDGES = 5_000_000
+
+# Character n-gram search index configuration.
+# NGRAM_N: size of the n-gram used for the inverted index (2 = bigram).
+# Queries >= NGRAM_N chars resolve via posting-list intersection (no full scan).
+# Queries < NGRAM_N chars have no n-grams; they fall back to a *bounded* scan
+# capped at SEARCH_FALLBACK_CAP items so worst-case work stays constant.
+NGRAM_N = 2
+SEARCH_FALLBACK_CAP = 100_000
+
+
+def _ngrams(text: str, n: int = NGRAM_N) -> set[str]:
+    """Normalized (lowercased) character n-gram set of `text`. Empty if too short."""
+    t = text.lower()
+    if len(t) < n:
+        return set()
+    return {t[i:i + n] for i in range(len(t) - n + 1)}
+
+
+def _item_ngrams(item: "Item", n: int = NGRAM_N) -> set[str]:
+    """Union of n-grams over an item's name and each of its tags."""
+    grams = _ngrams(item.name, n)
+    for tag in item.tags:
+        grams |= _ngrams(tag, n)
+    return grams
 
 
 @dataclass
@@ -48,6 +73,11 @@ class RelGraph:
         self._items: dict[str, Item] = {}
         self._edges: dict[tuple[str, str], float] = defaultdict(float)
         self._neighbors: dict[str, set[str]] = defaultdict(set)
+        # Inverted character n-gram index: ngram -> set of item ids that contain it
+        # (across name + tags). Maintained incrementally on every item mutation so a
+        # search resolves to a candidate set without scanning all items. Entries are
+        # dropped when their last item leaves, keeping memory bound to live items.
+        self._ngram_index: dict[str, set[str]] = defaultdict(set)
         self._sessions: dict[str, _Session] = {}
         self._lock = Lock()
         self._max_sessions = max_sessions
@@ -60,12 +90,33 @@ class RelGraph:
         self._rejected_items = 0
         self._wal = wal  # optional WriteAheadLog instance
 
+    def _index_add_locked(self, item: Item) -> None:
+        for g in _item_ngrams(item):
+            self._ngram_index[g].add(item.id)
+
+    def _index_remove_locked(self, item: Item) -> None:
+        for g in _item_ngrams(item):
+            ids = self._ngram_index.get(g)
+            if ids is not None:
+                ids.discard(item.id)
+                if not ids:
+                    del self._ngram_index[g]
+
+    def _reindex_locked(self) -> None:
+        self._ngram_index = defaultdict(set)
+        for it in self._items.values():
+            self._index_add_locked(it)
+
     def upsert_item(self, item: Item) -> None:
         with self._lock:
             if item.id not in self._items and len(self._items) >= self._max_items:
                 self._rejected_items += 1
                 raise ValueError(f"item cap reached ({self._max_items})")
+            old = self._items.get(item.id)
+            if old is not None:
+                self._index_remove_locked(old)
             self._items[item.id] = item
+            self._index_add_locked(item)
         if self._wal is not None:
             self._wal.append("upsert_item",
                              {"id": item.id, "name": item.name, "tags": list(item.tags)})
@@ -274,6 +325,7 @@ class RelGraph:
                 if not self._neighbors[nb]:
                     del self._neighbors[nb]
             self._neighbors.pop(item_id, None)
+            self._index_remove_locked(self._items[item_id])
             del self._items[item_id]
             return removed
 
@@ -311,11 +363,43 @@ class RelGraph:
     def _centrality(self, item_id: str) -> float:
         return sum(self._edges[_edge_key(item_id, nb)] for nb in self._neighbors.get(item_id, ()))
 
+    def _search_candidates_locked(self, q_lower: str) -> Iterable[str]:
+        """Item ids that *could* match `q_lower`, without scanning all items.
+
+        For queries >= NGRAM_N chars: intersect the posting lists of the query's
+        n-grams. Every true substring/exact-tag match contains all of the query's
+        n-grams, so the intersection is a superset of the true matches (the caller
+        verifies each candidate). If any n-gram is absent, nothing can match.
+
+        For queries < NGRAM_N chars: no n-grams exist, so fall back to a bounded
+        scan over at most SEARCH_FALLBACK_CAP items (constant worst-case work).
+        """
+        n = NGRAM_N
+        if len(q_lower) < n:
+            return list(itertools.islice(self._items.keys(), SEARCH_FALLBACK_CAP))
+        grams = {q_lower[i:i + n] for i in range(len(q_lower) - n + 1)}
+        posting: list[set[str]] = []
+        for g in grams:
+            ids = self._ngram_index.get(g)
+            if not ids:
+                return ()  # a required n-gram is missing -> no candidate can match
+            posting.append(ids)
+        posting.sort(key=len)  # intersect from the smallest posting list outward
+        candidates = set(posting[0])
+        for ids in posting[1:]:
+            candidates &= ids
+            if not candidates:
+                break
+        return candidates
+
     def search(self, q: str, k: int = 10) -> list[dict]:
         q_lower = q.lower()
         with self._lock:
             hits = []
-            for item in self._items.values():
+            for item_id in self._search_candidates_locked(q_lower):
+                item = self._items.get(item_id)
+                if item is None:
+                    continue
                 name_match = q_lower in item.name.lower()
                 tag_match = any(q_lower == t.lower() for t in item.tags)
                 if not (name_match or tag_match):
@@ -353,7 +437,11 @@ class RelGraph:
     def bulk_upsert(self, items: Iterable[Item]) -> None:
         with self._lock:
             for it in items:
+                old = self._items.get(it.id)
+                if old is not None:
+                    self._index_remove_locked(old)
                 self._items[it.id] = it
+                self._index_add_locked(it)
 
     def _evict_sessions_locked(self, now: float) -> int:
         cutoff = now - self._session_idle_sec
@@ -459,4 +547,5 @@ class RelGraph:
             self._neighbors = defaultdict(set)
             for k, v in payload["neighbors"].items():
                 self._neighbors[k] = set(v)
+            self._reindex_locked()
         return payload["stats"]
